@@ -18,6 +18,7 @@ use crate::oauth2::{Authorization, TokenCache};
 use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::Duration;
 
 const USER_AGENT: &str = concat!("Dropbox-APIv2-Rust/", env!("CARGO_PKG_VERSION"));
 
@@ -217,7 +218,8 @@ impl UreqClient {
         debug!("request for {:?}", url);
 
         let mut req = ureq::post(&url)
-            .set("User-Agent", USER_AGENT);
+            .set("User-Agent", USER_AGENT)
+            .timeout(Duration::from_secs(30));
 
         if let Some(token) = token {
             req = req.set("Authorization", &format!("Bearer {}", token));
