@@ -288,9 +288,11 @@ enum AuthorizationState {
         flow_type: Oauth2Type,
         auth_code: String,
         redirect_uri: Option<String>,
+        client_secret: Option<String>,
     },
     Refresh {
         client_id: String,
+        client_secret: String,
         refresh_token: String,
     },
     AccessToken(String),
@@ -307,17 +309,18 @@ impl Authorization {
     /// (or via manual user entry if not using a redirect URI) after the user logs in.
     ///
     /// Requires the client ID; the type of OAuth2 flow being used (including the client secret or
-    /// the PKCE challenge); the authorization code; and the redirect URI used for the original
-    /// authorization request, if any.
+    /// the PKCE challenge); the authorization code; the redirect URI used for the original
+    /// authorization request, if any; and the client_secret if using PKCE flow.
     pub fn from_auth_code(
         client_id: String,
         flow_type: Oauth2Type,
         auth_code: String,
         redirect_uri: Option<String>,
+        client_secret: Option<String>,
     ) -> Self {
         Self {
             state: AuthorizationState::InitialAuth {
-                client_id, flow_type, auth_code, redirect_uri },
+                client_id, flow_type, auth_code, redirect_uri, client_secret },
         }
     }
 
@@ -330,7 +333,7 @@ impl Authorization {
             AuthorizationState::InitialAuth { .. } => None,
             AuthorizationState::AccessToken(access_token) =>
                 Some(format!("1&{}", access_token)),
-            AuthorizationState::Refresh { client_id: _, refresh_token } =>
+            AuthorizationState::Refresh { refresh_token, .. } =>
                 Some(format!("2&{}", refresh_token)),
         }
     }
@@ -343,11 +346,12 @@ impl Authorization {
     /// Note that a loaded authorization state is not necessarily still valid and may produce
     /// [`Authentication`](crate::Error::Authentication) errors. In such a case you should also
     /// start the authorization procedure from scratch.
-    pub fn load(client_id: String, saved: &str) -> Option<Self> {
+    pub fn load(client_id: String, client_secret: String, saved: &str) -> Option<Self> {
         let state = match saved.get(0..2) {
             Some("1&") => AuthorizationState::AccessToken(saved[2..].to_owned()),
             Some("2&") => AuthorizationState::Refresh {
                 client_id,
+                client_secret,
                 refresh_token: saved[2..].to_owned(),
             },
             _ => {
@@ -361,9 +365,10 @@ impl Authorization {
     /// Recreate the authorization from an authorization code and refresh token.
     pub fn from_refresh_token(
         client_id: String,
+        client_secret: String,
         refresh_token: String,
     ) -> Self {
-        Self { state: AuthorizationState::Refresh { client_id, refresh_token } }
+        Self { state: AuthorizationState::Refresh { client_id, client_secret, refresh_token } }
     }
 
     /// Recreate the authorization from a long-lived access token. This token cannot be refreshed;
@@ -379,8 +384,8 @@ impl Authorization {
     /// updated token when a short-lived access token has expired.
     pub fn obtain_access_token(&mut self, client: impl NoauthClient) -> crate::Result<String> {
         let client_id: String;
+        let client_secret: String;
         let mut redirect_uri = None;
-        let mut client_secret = None;
         let mut pkce_code = None;
         let mut refresh_token = None;
         let mut auth_code = None;
@@ -390,7 +395,7 @@ impl Authorization {
                 return Ok(token);
             }
             AuthorizationState::InitialAuth {
-                client_id: id, flow_type, auth_code: code, redirect_uri: uri } =>
+                client_id: id, flow_type, auth_code: code, redirect_uri: uri, client_secret: secret } =>
             {
                 match flow_type {
                     Oauth2Type::ImplicitGrant(_secret) => {
@@ -398,18 +403,25 @@ impl Authorization {
                         return Ok(code);
                     }
                     Oauth2Type::AuthorizationCode(secret) => {
-                        client_secret = Some(secret);
+                        // use the OAuth2 flow client_secret, in which case the InitialAuth secret
+                        // may be none
+                        client_secret = secret;
                     }
                     Oauth2Type::PKCE(pkce) => {
                         pkce_code = Some(pkce.code);
+                        // use the InitialAuth secret, which is required to use the refresh token
+                        // returned from the OAuth2 token endpoint
+                        client_secret = secret
+                            .expect("need client secret to use refresh token returned by PKCE flow");
                     }
                 }
                 client_id = id;
                 auth_code = Some(code);
                 redirect_uri = uri;
             }
-            AuthorizationState::Refresh { client_id: id, refresh_token: refresh } => {
+            AuthorizationState::Refresh { client_id: id, client_secret: secret, refresh_token: refresh } => {
                 client_id = id;
+                client_secret = secret;
                 refresh_token = Some(refresh);
             }
         }
@@ -426,13 +438,12 @@ impl Authorization {
 
         params.append_pair("client_id", &client_id);
 
-        if refresh_token.is_none() {
-            if let Some(pkce) = pkce_code {
+        match pkce_code {
+            Some(pkce) => {
                 params.append_pair("code_verifier", &pkce);
-            } else {
-                params.append_pair(
-                    "client_secret",
-                    &client_secret.expect("need either PKCE code or client secret"));
+            }
+            None => {
+                params.append_pair("client_secret", &client_secret);
             }
         }
 
@@ -452,32 +463,27 @@ impl Authorization {
             None,
         )?;
 
-        let result_json = serde_json::from_str(&resp.result_json)?;
+        let mut result_json: serde_json::Value = serde_json::from_str(&resp.result_json)?;
         debug!("OAuth2 response: {:?}", result_json);
 
-        let access_token: String;
-        let refresh_token: Option<String>;
+        let map = result_json.as_object_mut()
+            .ok_or(Error::UnexpectedResponse("response is not a JSON object"))?;
 
-        match result_json {
-            serde_json::Value::Object(mut map) => {
-                match map.remove("access_token") {
-                    Some(serde_json::Value::String(token)) => access_token = token,
-                    _ => return Err(Error::UnexpectedResponse("no access token in response!")),
-                }
-                match map.remove("refresh_token") {
-                    Some(serde_json::Value::String(refresh)) => refresh_token = Some(refresh),
-                    Some(_) => {
-                        return Err(Error::UnexpectedResponse("refresh token is not a string!"));
-                    },
-                    None => refresh_token = None,
-                }
-            },
-            _ => return Err(Error::UnexpectedResponse("response is not a JSON object")),
+        let access_token = match map.remove("access_token") {
+            Some(serde_json::Value::String(token)) => token,
+            _ => return Err(Error::UnexpectedResponse("no access token in response!")),
+        };
+
+        if let Some(value) = map.remove("refresh_token") {
+            match value {
+                serde_json::Value::String(refresh) => refresh_token = Some(refresh),
+                _ => return Err(Error::UnexpectedResponse("refresh token is not a string!"))
+            }
         }
 
         match refresh_token {
             Some(refresh) => {
-                self.state = AuthorizationState::Refresh { client_id, refresh_token: refresh };
+                self.state = AuthorizationState::Refresh { client_id, client_secret, refresh_token: refresh };
             }
             None => {
                 self.state = AuthorizationState::AccessToken(access_token.clone());
@@ -531,8 +537,9 @@ impl TokenCache {
     }
 }
 
-/// Get an [`Authorization`] instance from environment variables `DBX_CLIENT_ID` and `DBX_OAUTH`
-/// (containing a refresh token) or `DBX_OAUTH_TOKEN` (containing a legacy long-lived token).
+/// Get an [`Authorization`] instance from environment variables `DBX_CLIENT_ID`,
+/// `DBX_CLIENT_SECRET`, and `DBX_OAUTH` (containing a refresh token) or `DBX_OAUTH_TOKEN`
+/// (containing a legacy long-lived token).
 ///
 /// If environment variables are not set, and stdin is a terminal, prompt interactively for
 /// authorization.
@@ -553,11 +560,11 @@ pub fn get_auth_from_env_or_prompt() -> Authorization {
         return Authorization::from_access_token(long_lived);
     }
 
-    if let (Ok(client_id), Ok(saved))
-        = (env::var("DBX_CLIENT_ID"), env::var("DBX_OAUTH"))
+    if let (Ok(client_id), Ok(client_secret), Ok(saved))
+        = (env::var("DBX_CLIENT_ID"), env::var("DBX_CLIENT_SECRET"), env::var("DBX_OAUTH"))
         // important! see the above warning about using environment variables for this
     {
-        match Authorization::load(client_id, &saved) {
+        match Authorization::load(client_id, client_secret, &saved) {
             Some(auth) => return auth,
             None => {
                 eprintln!("saved authorization in DBX_CLIENT_ID and DBX_OAUTH are invalid");
@@ -567,7 +574,7 @@ pub fn get_auth_from_env_or_prompt() -> Authorization {
     }
 
     if !atty::is(atty::Stream::Stdin) {
-        panic!("DBX_CLIENT_ID and/or DBX_OAUTH not set, and stdin not a TTY; cannot authorize");
+        panic!("DBX_CLIENT_ID, DBX_CLIENT_SECRET, and/or DBX_OAUTH not set, and stdin not a TTY; cannot authorize");
     }
 
     fn prompt(msg: &str) -> String {
@@ -579,6 +586,7 @@ pub fn get_auth_from_env_or_prompt() -> Authorization {
     }
 
     let client_id = prompt("Give me a Dropbox API app key");
+    let client_secret = prompt("Give me a Dropbox API app secret");
 
     let oauth2_flow = Oauth2Type::PKCE(PkceCode::new());
     let url = AuthorizeUrlBuilder::new(&client_id, &oauth2_flow)
@@ -593,5 +601,6 @@ pub fn get_auth_from_env_or_prompt() -> Authorization {
         oauth2_flow,
         auth_code.trim().to_owned(),
         None,
+        Some(client_secret),
     )
 }
